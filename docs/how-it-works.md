@@ -1,10 +1,9 @@
-# How codex-bg works / 运行原理
+# How codex-bg works
+
+[中文](how-it-works.zh-CN.md)
 
 The launcher, runner, and viewer have separate lifetimes. Codex starts a job and
 can end its turn. The job does not live inside the terminal that displays it.
-
-启动器、执行器、查看器的生命周期分开：模型只负责启动和处理结果，执行器负责等待命令，
-查看器负责展示日志。关闭查看器不会结束后台命令。
 
 ```mermaid
 flowchart TD
@@ -97,9 +96,9 @@ line**. A successful queue operation can accompany a failed test command.
 Messages can arrive late or remain queued for a closed session. The script does
 not force `--resume`, route to a remote server, or guarantee exactly-once delivery.
 Agents should match the unit to prior work before acting on a delayed message.
-
-完成状态先写入磁盘，通知后发送；通知失败不抹掉任务结果。收到延迟通知时应先核对 unit，
-不要把已经处理过的失败当成新的失败而盲目重跑。
+Write the finished status to disk before notifying; a failed wake does not erase
+the command result. When a delayed message arrives, confirm the unit against
+prior work before rerunning.
 
 ## 4. Herdr pane ownership
 

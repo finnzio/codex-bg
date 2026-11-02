@@ -1,6 +1,6 @@
 # codex-bg
 
-[English](README.md) · [运行原理](docs/how-it-works.md) · [Agent 技能](skills/codex-bg/SKILL.md)
+[English](README.md) · [运行原理](docs/how-it-works.zh-CN.md) · [Agent 技能](skills/codex-bg/SKILL.md)
 
 让长任务在 Codex 回合之外运行，结束后通过 `codex queue` 把结果送回原线程。
 等待期间不需要模型反复查询状态。在 Herdr 中可自动打开进度窗格，显示真实日志，

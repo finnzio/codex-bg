@@ -13,7 +13,14 @@ set -euo pipefail
 
 STATE=${CODEX_BG_STATE_DIR:-/tmp/codex-bg}
 HEAVY_SLOTS=2
-SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+PLATFORM=$(uname -s)
+if [[ $PLATFORM == Darwin ]]; then
+  command -v python3 >/dev/null || { echo 'codex-bg: macOS requires Python 3.9+' >&2; exit 2; }
+  SCRIPT_PATH=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")
+else
+  SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+fi
+MAC_HELPER="${SCRIPT_PATH%/*}/codex-bg-macos.py"
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
 
@@ -21,7 +28,7 @@ have_systemd() { systemctl --user is-system-running >/dev/null 2>&1 || [[ $(syst
 
 cmd_list() {
   local files=() i line
-  mapfile -t files < <(ls -1t "$STATE"/*.status 2>/dev/null)
+  while IFS= read -r line; do files+=("$line"); done < <(ls -1t "$STATE"/*.status 2>/dev/null)
   for ((i=0; i<${#files[@]} && i<20; i++)); do
     line=""
     IFS= read -r line < "${files[i]}" || true
@@ -58,7 +65,11 @@ cmd_watch() (
   status="$STATE/$unit.status"
   [[ -f $status ]] || { echo "codex-bg: job not found: $unit" >&2; exit 2; }
   printf 'codex-bg: %s\nLog: %s\nClose this pane freely; the background task keeps running.\n\n' "$unit" "$log"
-  tail -n 80 --follow=name --retry --sleep-interval=0.2 -- "$log" &
+  if [[ $PLATFORM == Darwin ]]; then
+    tail -n 80 -F "$log" &
+  else
+    tail -n 80 --follow=name --retry --sleep-interval=0.2 -- "$log" &
+  fi
   viewer_tail=$!
   cleanup_viewer() {
     kill "$viewer_tail" 2>/dev/null || true
@@ -124,6 +135,10 @@ cmd_pane() {
 cmd_stop() {
   local unit=${1:?unit name required}
   validate_unit "$unit"
+  if [[ $PLATFORM == Darwin ]]; then
+    python3 "$MAC_HELPER" stop "$STATE" "$unit"
+    return
+  fi
   systemctl --user stop "$unit"
   [[ -f $STATE/$unit.status ]] && echo "state=stopped stopped=$(date -Is)" > "$STATE/$unit.status"
   echo "stopped $unit (no wake message is sent for a stopped job)"
@@ -190,20 +205,33 @@ cmd_run() {
   local codex; codex=$(command -v codex) || { echo "codex-bg: codex not on PATH" >&2; exit 2; }
   name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-40)
 
+  if [[ $PLATFORM == Darwin ]]; then
+    [[ -z $mem ]] || { echo 'codex-bg: --mem is not supported on macOS (no systemd-equivalent memory cap)' >&2; exit 2; }
+    umask 077
+    STATE=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$STATE")
+  fi
+
   mkdir -p "$STATE"
   local unit="codex-bg-$name-$(date +%Y%m%d-%H%M%S)"
   log=${log:-$STATE/$unit.log}
-  log=$(realpath -m -- "$log")
+  if [[ $PLATFORM == Darwin ]]; then
+    log=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$log")
+  else
+    log=$(realpath -m -- "$log")
+  fi
   local status="$STATE/$unit.status"
 
   local use_systemd=0
-  if have_systemd; then
+  if [[ $PLATFORM != Darwin ]] && have_systemd; then
     use_systemd=1
     if [[ -n $(systemctl --user list-units "codex-bg-$name-*" --state=active,activating --no-legend --no-pager) ]]; then
       echo "codex-bg: a job named '$name' is already running (codex-bg list); stop it or pick another --name" >&2; exit 3
     fi
   fi
 
+  if [[ $PLATFORM == Darwin ]]; then
+    python3 "$MAC_HELPER" launch "$STATE" "$unit" "$name" "$thread" "$codex" "$PWD" "$log" "$heavy" ${envs[@]+"${envs[@]}"} -- "$@"
+  else
   # Create the files before showing a viewer, including when a heavy slot is pending.
   mkdir -p -- "$(dirname -- "$log")"
   : > "$log"
@@ -222,6 +250,7 @@ cmd_run() {
     setsid nohup bash -c "$RUNNER" _ "$log" "$status" "$thread" "$codex" "$unit" "$name" "$heavy" "" -- "$@" \
       > "$STATE/$unit.runner.log" 2>&1 < /dev/null &
     disown || true
+  fi
   fi
   echo "started $unit"
   echo "log:    $log"

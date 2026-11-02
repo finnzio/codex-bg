@@ -6,6 +6,7 @@ from pathlib import Path
 import select
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -13,6 +14,7 @@ import uuid
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "codex-bg"
+IS_DARWIN = sys.platform == "darwin"
 STUB = '''#!/usr/bin/env python3
 import json, os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
@@ -29,6 +31,7 @@ if name == 'herdr':
 '''
 
 
+@unittest.skipIf(IS_DARWIN, "systemd launch path; macOS coverage is in test_macos.py")
 class CodexBgTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="codex-bg-test-")
@@ -162,6 +165,7 @@ class CodexBgTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.environ.get("CODEX_BG_LIVE_HERDR") == "1", "opt-in live Herdr/systemd check")
+@unittest.skipUnless(sys.platform.startswith("linux"), "live systemd/Herdr checks need Linux pidfd and user systemd")
 class CodexBgLiveTests(unittest.TestCase):
     def test_finished_job_automatically_closes_only_its_progress_pane(self):
         with tempfile.TemporaryDirectory(prefix="codex-bg-live-close-") as directory:
@@ -225,6 +229,7 @@ class CodexBgLiveTests(unittest.TestCase):
                 subprocess.run(["herdr", "pane", "wait-output", pane, "--match", "smoke-start", "--timeout", "5000"],
                                env=env, capture_output=True, check=True, timeout=8)
                 pid = int(subprocess.check_output(["systemctl", "--user", "show", unit, "-p", "MainPID", "--value"], text=True))
+                # pidfd_open is Linux-only; this class is already skipped off Linux.
                 fd = os.pidfd_open(pid)
                 try:
                     subprocess.run(["herdr", "pane", "close", pane], env=env, capture_output=True, check=True, timeout=5)

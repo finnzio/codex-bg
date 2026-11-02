@@ -10,13 +10,20 @@
 
 ## 安装
 
-需要 Linux、Bash 4+、GNU coreutils、util-linux（`flock`、`setsid`）。
-推荐启用 user systemd 并安装 jq。可选 Herdr；非 Herdr 环境也能运行后台任务。
-不支持原生 macOS / Windows；WSL 的 Linux 环境需要另行确认 user systemd 可用。
+- **Linux（主路径）**：Bash 4+、GNU coreutils、util-linux（`flock`、`setsid`）。
+  推荐启用 user systemd；`systemd-run` 需支持 `--expand-environment=no`。
+  WSL 需另行确认 user systemd 可用。
+- **macOS（launchd）**：系统自带 Bash 3.2 即可启动器；需要 **Python 3.9+** 与
+  `launchctl`。任务以临时 launchd 服务登记。**不支持 `--mem`**，传入会报错退出。
+  macOS 支持**未在个人真机验证**，以 GitHub Actions `macos-latest`（单测 + 真实
+  launchd 冒烟，`codex` 用桩）为准。不支持 Windows。
+- 推荐安装 jq。可选 Herdr；非 Herdr 环境也能跑后台任务。
 
 **先执行 `codex queue --help`。** 当前 Codex 必须提供 `queue --thread --message`，
 且活动会话需注入 `CODEX_THREAD_ID`。不是每个 Codex 构建都有该命令，本工具不会补装它。
-systemd-run 还需支持 `--expand-environment=no`。
+
+Linux 运行助手本身不依赖 Python。macOS 由 `bin/codex-bg-macos.py` 驱动 launchd，
+`install.sh` 会把它与启动器装到同一目录。
 
 ```bash
 git clone https://github.com/finnzio/codex-bg.git
@@ -57,8 +64,8 @@ codex-bg stop <unit>
 | --- | --- |
 | `--name` | 任务短名，附加时间戳生成 unit |
 | `--heavy` | 在同一状态目录中限制重任务最多两个并发 |
-| `--mem` | systemd 子 scope 的内存上限，禁用该 scope 的 swap |
-| `--env KEY` | 按变量名向 systemd runner 转发环境变量，可重复 |
+| `--mem` | systemd 子 scope 的内存上限，禁用该 scope 的 swap（仅 Linux；macOS 上报错） |
+| `--env KEY` | 按变量名向 runner 转发环境变量，可重复 |
 | `--log FILE` | 自定义日志路径，查看器需要 jq 读取元数据 |
 | `--no-pane` | 不自动创建 Herdr 窗格 |
 
@@ -82,8 +89,10 @@ codex-bg stop <unit>
 保存日志、状态，以及 jq 可用时的 JSON 元数据。在共享机器上选择用户私有目录并设置
 严格的 umask。日志原样保存，不会自动脱敏；不要让命令输出密钥。
 
-推荐 systemd 模式：无 user systemd 时退回 `setsid` + `nohup`，仍可后台执行和发送完成消息，
+Linux 推荐 systemd：无 user systemd 时退回 `setsid` + `nohup`，仍可后台执行和发送完成消息，
 但**没有内存限制、重名任务拦截或可用的 `stop` 命令**。退回模式会继承启动环境。
+macOS 用 launchd 提供重名检查与 `stop`；没有 systemd 式内存上限（`--mem` 直接拒绝）。
+`--heavy` 槽位在 macOS 上用 Python `fcntl.flock`，不用 `flock` 命令。
 
 `codex queue` 接受消息不等于会话已经恢复；关闭或忙碌的会话可能暂存消息。
 发送失败会重试三次，最终标记 `wake=failed`；不保证恰好一次通知。
@@ -98,8 +107,9 @@ python3 -m unittest discover -s tests -v
 CODEX_BG_LIVE_HERDR=1 python3 -m unittest discover -s tests -v
 ```
 
-需要 Python 3.9+。普通测试使用命令替身；真实测试需要 Linux、Herdr 和 user systemd，
-会创建并清理临时任务与 pane。完成消息接收器使用本地替身，不给真实 Codex 会话发消息。
-GitHub Actions 运行普通测试，不把它当成真实 Codex/Herdr 验收。
+需要 Python 3.9+。普通测试使用命令替身（含假 `launchctl`）；可选的 Linux 真实测试需要
+Herdr 和 user systemd，会创建并清理临时任务与 pane。完成消息接收器使用本地替身，
+不给真实 Codex 会话发消息。GitHub Actions 在 `ubuntu-latest` 与 `macos-latest` 上跑单测；
+macOS job 另跑一次真实 launchd 冒烟（stub `codex`）。不把它当成真实 Codex/Herdr 验收。
 
 许可证：[MIT](LICENSE)。

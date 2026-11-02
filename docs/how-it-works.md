@@ -8,10 +8,13 @@ can end its turn. The job does not live inside the terminal that displays it.
 
 ```mermaid
 flowchart TD
-    A[Codex shell: codex-bg run] --> B{User systemd available?}
+    A[Codex shell: codex-bg run] --> P{Platform}
+    P -->|macOS| M[launchd temporary plist via Python helper]
+    P -->|Linux| B{User systemd available?}
     B -->|yes| C[Detached transient user service]
     B -->|no| D[setsid + nohup runner]
-    C --> E[Optional heavy-slot lock]
+    M --> E[Optional heavy-slot lock]
+    C --> E
     D --> E
     E --> F[Execute command and capture output]
     F --> G[Write finished status and exit code]
@@ -31,9 +34,9 @@ flowchart TD
 second-resolution timestamp to form `codex-bg-NAME-YYYYMMDD-HHMMSS`.
 
 The launcher creates the log and starting status **before** opening a pane.
-In systemd mode it rejects an already-active job with the same label. This check
-is not an atomic, global scheduler lock; avoid concurrent launches of the same
-name. The fallback has no duplicate-name check.
+In systemd and launchd modes it rejects an already-active job with the same
+label. This check is not an atomic, global scheduler lock; avoid concurrent
+launches of the same name. The Linux setsid fallback has no duplicate-name check.
 
 Each job stores:
 
@@ -41,29 +44,41 @@ Each job stores:
 | --- | --- |
 | `UNIT.log` (or `--log`) | Command stdout and stderr |
 | `UNIT.status` | First line: lifecycle status; subsequent lines may contain queue output |
-| `UNIT.json` | Log path, launch directory, and optional pane ID; requires jq |
-| `UNIT.runner.log` | Runner diagnostics in setsid fallback mode |
+| `UNIT.json` | Log path, launch directory, backend metadata, and optional pane ID |
+| `UNIT.plist` / `UNIT.launch.json` | macOS launchd job definition and runner config (removed on `stop`) |
+| `UNIT.runner.log` | Runner diagnostics (setsid fallback or launchd helper stdout/stderr) |
 | `heavy.N.lock` | Shared file locks for participating heavy jobs |
+| `name.NAME.lock` | macOS same-name admission lock |
 
 The default directory is `/tmp/codex-bg`. Files are not a persistent queue or a
 database, and `list` does not reconcile every status with live processes.
 
 ## 2. Detached execution
 
-With a usable user systemd manager, `systemd-run` starts a transient service for
-the runner. With `--mem`, the command runs inside a child scope with `MemoryMax`
+**Linux + user systemd.** `systemd-run` starts a transient service for the
+runner. With `--mem`, the command runs inside a child scope with `MemoryMax`
 and `MemorySwapMax=0`; the runner itself is outside that cap so it can record an
 OOM-related command failure. Exit 137 is logged as a *possible* memory kill,
 not proof of one.
 
-Without user systemd, `setsid nohup` detaches the runner. This path has no memory
-cap or supported `stop` implementation. It is a reduced fallback, not equivalent
-process management. Neither mode promises survival across reboot or user-manager
-shutdown.
+**Linux without user systemd.** `setsid nohup` detaches the runner. This path
+has no memory cap or supported `stop` implementation. It is a reduced fallback,
+not equivalent process management.
 
-`--heavy` acquires one of two `flock` slots before command execution. The runner
-checks for an available slot every 15 seconds; this is local process waiting,
-not a model call. Slots are scoped by the state directory, not by repository.
+**macOS + launchd.** `bin/codex-bg-macos.py` writes a temporary plist under the
+state directory (`UNIT.plist`), bootstraps it with `launchctl` into `gui/$UID`
+when that domain answers, otherwise `user/$UID`, and runs the same lifecycle as
+the Linux runner (status lines, heavy slots, `codex queue`). `--mem` is rejected
+up front. `fcntl.flock` replaces the `flock` CLI. Completion notification text
+matches the Linux runner. This path is verified on GitHub `macos-latest`, not on
+a personal Mac.
+
+Neither backend promises survival across reboot or session teardown.
+
+`--heavy` acquires one of two file-lock slots before command execution. On Linux
+the runner polls every 15 seconds with `flock`; on macOS it polls more frequently
+with Python `fcntl.flock`. This is local process waiting, not a model call.
+Slots are scoped by the state directory, not by repository.
 
 ## 3. Completion and wake delivery
 
@@ -106,10 +121,12 @@ change task status or trigger retries of the workload.
 
 ## 5. Cancellation and trust
 
-`stop` asks user systemd to stop the named unit, then writes `state=stopped`.
-It intentionally sends no completion notification. It does not roll back command
-side effects. Status files are not a cancellation API; editing a status file
-does not stop a process.
+`stop` asks user systemd (Linux) or `launchctl bootout` (macOS) to stop the named
+unit, then writes `state=stopped` when the job had not already finished. On
+macOS it also deletes the temporary plist and launch config so forwarded
+environment values do not linger. It intentionally sends no completion
+notification. It does not roll back command side effects. Status files are not a
+cancellation API; editing a status file does not stop a process.
 
 This tool runs trusted commands as the current user. Command output and queue
 diagnostics can contain sensitive data. Use a private state directory, pass

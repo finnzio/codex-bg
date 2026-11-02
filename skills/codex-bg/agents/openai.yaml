@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Background Jobs"
+  short_description: "Run long jobs and return completion to Codex"
+  default_prompt: "Use $codex-bg to run this long task and continue when it finishes."

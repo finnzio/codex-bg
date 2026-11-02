@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# codex-bg: run a long command outside the Codex turn, then wake the same Codex
+# session with `codex queue`. Waiting costs no model calls.
+#
+#   codex-bg run [--name N] [--heavy] [--mem 8G] [--env KEY]... [--log FILE] [--no-pane] -- CMD [ARG]...
+#   codex-bg list
+#   codex-bg stop UNIT
+#   codex-bg pane UNIT    # Show an existing job in a Herdr pane on the right
+#   codex-bg watch UNIT   # Read-only foreground progress viewer
+#
+# Needs CODEX_THREAD_ID (Codex sets it in every shell command).
+set -euo pipefail
+
+STATE=${CODEX_BG_STATE_DIR:-/tmp/codex-bg}
+HEAVY_SLOTS=2
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-2}"; }
+
+have_systemd() { systemctl --user is-system-running >/dev/null 2>&1 || [[ $(systemctl --user is-system-running 2>/dev/null) == degraded ]]; }
+
+cmd_list() {
+  local files=() i line
+  mapfile -t files < <(ls -1t "$STATE"/*.status 2>/dev/null)
+  for ((i=0; i<${#files[@]} && i<20; i++)); do
+    line=""
+    IFS= read -r line < "${files[i]}" || true
+    printf '%s  %s\n' "$(basename "${files[i]%.status}")" "$line"
+  done
+}
+
+validate_unit() {
+  [[ ${1:-} =~ ^codex-bg-[A-Za-z0-9_-]+-[0-9]{8}-[0-9]{6}$ ]] || {
+    echo "codex-bg: invalid unit name" >&2; return 2;
+  }
+}
+
+job_log() {
+  local unit=$1
+  if [[ -f $STATE/$unit.json ]] && command -v jq >/dev/null; then
+    jq -er '.log' "$STATE/$unit.json"
+  else
+    printf '%s\n' "$STATE/$unit.log"
+  fi
+}
+
+# Only a reader lives in the pane. HUP/INT/TERM stop this viewer and its tail,
+# never the detached runner or the task's systemd scope.
+cmd_watch() (
+  local unit=${1:?unit name required} log status line previous="" viewer_tail close_pane=${2:-} completed=0
+  validate_unit "$unit"
+  # Only an automatically launched viewer may close its own pane. Never fall
+  # back to the focused pane or a job's metadata (another viewer may replace it).
+  if [[ -n $close_pane && ( ${HERDR_ENV:-} != 1 || $close_pane != "${HERDR_PANE_ID:-}" ) ]]; then
+    echo "codex-bg: viewer pane does not match the current Herdr pane" >&2; exit 2
+  fi
+  log=$(job_log "$unit")
+  status="$STATE/$unit.status"
+  [[ -f $status ]] || { echo "codex-bg: job not found: $unit" >&2; exit 2; }
+  printf 'codex-bg: %s\nLog: %s\nClose this pane freely; the background task keeps running.\n\n' "$unit" "$log"
+  tail -n 80 --follow=name --retry --sleep-interval=0.2 -- "$log" &
+  viewer_tail=$!
+  cleanup_viewer() {
+    kill "$viewer_tail" 2>/dev/null || true
+    wait "$viewer_tail" 2>/dev/null || true
+    if [[ $completed == 1 && -n $close_pane ]]; then
+      herdr pane close "$close_pane" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup_viewer EXIT
+  trap 'exit 0' HUP INT TERM
+  while kill -0 "$viewer_tail" 2>/dev/null; do
+    line=""
+    IFS= read -r line < "$status" || true
+    if [[ -n $line && $line != "$previous" ]]; then
+      printf '\n[%s]\n' "$line"
+      previous=$line
+    fi
+    case $line in
+      state=finished*|state=stopped*) completed=1; sleep 0.3; break ;;
+    esac
+    sleep 1
+  done
+)
+
+cmd_pane() {
+  local unit=${1:?unit name required} current response pane_id watch_cmd metadata
+  validate_unit "$unit" || return
+  # Never use another client's focused pane as a fallback.
+  [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || {
+    echo "codex-bg: no Herdr caller pane; task continues without a progress pane" >&2; return 1;
+  }
+  command -v herdr >/dev/null && command -v jq >/dev/null || {
+    echo "codex-bg: herdr/jq unavailable; task continues without a progress pane" >&2; return 1;
+  }
+  [[ -f $STATE/$unit.status ]] || { echo "codex-bg: job not found: $unit" >&2; return 2; }
+  current=$(herdr pane current --current) || return
+  jq -e '.result.pane.pane_id and .result.pane.tab_id' <<< "$current" >/dev/null || return 1
+  metadata="$STATE/$unit.json"
+  if [[ ! -f $metadata ]]; then
+    jq -n --arg log "$(job_log "$unit")" --arg cwd "$PWD" '{log:$log,cwd:$cwd}' > "$metadata" || return
+  fi
+  if [[ -f $metadata ]]; then
+    pane_id=$(jq -r '.pane_id // empty' "$metadata")
+    if [[ -n $pane_id ]] && response=$(herdr pane get "$pane_id" 2>/dev/null) &&
+      jq -e --arg tab "$(jq -r '.result.pane.tab_id' <<< "$current")" \
+        '.result.pane.tab_id == $tab' <<< "$response" >/dev/null; then
+      echo "progress pane: $pane_id (already open)"
+      return 0
+    fi
+  fi
+  response=$(herdr pane split --current --direction right --cwd "$PWD" --no-focus) || return
+  pane_id=$(jq -er '.result.pane.pane_id' <<< "$response") || return
+  if [[ -f $metadata ]]; then
+    jq --arg pane "$pane_id" '.pane_id = $pane' "$metadata" > "$metadata.tmp" || return
+    mv -- "$metadata.tmp" "$metadata" || return
+  fi
+  herdr pane rename "$pane_id" "bg: $unit" >/dev/null || true
+  printf -v watch_cmd '%q ' env "CODEX_BG_STATE_DIR=$STATE" "$SCRIPT_PATH" watch "$unit" "$pane_id"
+  herdr pane run "$pane_id" "$watch_cmd" >/dev/null || return
+  echo "progress pane: $pane_id (right, current tab; auto-closes when finished; closing it does not stop the task)"
+}
+
+cmd_stop() {
+  local unit=${1:?unit name required}
+  validate_unit "$unit"
+  systemctl --user stop "$unit"
+  [[ -f $STATE/$unit.status ]] && echo "state=stopped stopped=$(date -Is)" > "$STATE/$unit.status"
+  echo "stopped $unit (no wake message is sent for a stopped job)"
+}
+
+# The runner executes inside the detached unit. Arguments:
+# log status thread codex unit name heavy mem -- CMD...
+# The memory cap goes on a child scope around CMD only, so an OOM kill of CMD
+# still leaves this runner alive to record the exit and send the wake message.
+RUNNER='
+log=$1 status=$2 thread=$3 codex=$4 unit=$5 name=$6 heavy=$7 mem=$8; shift 9
+state=$(dirname "$status")
+if [ "$heavy" = 1 ]; then
+  echo "state=waiting-heavy-slot" > "$status"
+  while :; do
+    for slot in $(seq 1 '"$HEAVY_SLOTS"'); do
+      exec 9>"$state/heavy.$slot.lock"
+      if flock -n 9; then break 2; fi
+      exec 9>&-
+    done
+    sleep 15
+  done
+fi
+echo "state=running started=$(date -Is)" > "$status"
+start=$(date +%s)
+set +e
+if [ -n "$mem" ]; then
+  systemd-run --user --scope --quiet --collect -p MemoryMax="$mem" -p MemorySwapMax=0 -- "$@" > "$log" 2>&1
+else
+  "$@" > "$log" 2>&1
+fi
+code=$?
+[ "$code" = 137 ] && [ -n "$mem" ] && echo "codex-bg: exit 137, likely killed at the --mem $mem cap" >> "$log"
+set -e
+dur=$(( $(date +%s) - start ))
+echo "state=finished exit=$code duration=${dur}s finished=$(date -Is)" > "$status"
+msg="[codex-bg] $name finished: exit=$code duration=${dur}s log=$log unit=$unit. Read the end of the log (tail/rg), then continue the task. Do not re-run it unless the log shows it must be."
+for attempt in 1 2 3; do
+  if "$codex" queue --thread "$thread" --message "$msg" >> "$status" 2>&1; then exit 0; fi
+  sleep 5
+done
+echo "wake=failed" >> "$status"
+exit 1
+'
+
+cmd_run() {
+  local name=job heavy=0 mem="" log="" no_pane=0 envs=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --name) name=$2; shift 2 ;;
+      --heavy) heavy=1; shift ;;
+      --mem) mem=$2; shift 2 ;;
+      --env) envs+=("$2"); shift 2 ;;
+      --log) log=$2; shift 2 ;;
+      --no-pane) no_pane=1; shift ;;
+      --) shift; break ;;
+      -h|--help) usage 0 ;;
+      *) echo "codex-bg: unknown option $1 (put the command after --)" >&2; exit 2 ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || { echo "codex-bg: no command after --" >&2; exit 2; }
+  local thread=${CODEX_THREAD_ID:-}
+  [[ -n $thread ]] || { echo "codex-bg: CODEX_THREAD_ID is empty; run this from a Codex shell command" >&2; exit 2; }
+  local codex; codex=$(command -v codex) || { echo "codex-bg: codex not on PATH" >&2; exit 2; }
+  name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-' | cut -c1-40)
+
+  mkdir -p "$STATE"
+  local unit="codex-bg-$name-$(date +%Y%m%d-%H%M%S)"
+  log=${log:-$STATE/$unit.log}
+  log=$(realpath -m -- "$log")
+  local status="$STATE/$unit.status"
+
+  local use_systemd=0
+  if have_systemd; then
+    use_systemd=1
+    if [[ -n $(systemctl --user list-units "codex-bg-$name-*" --state=active,activating --no-legend --no-pager) ]]; then
+      echo "codex-bg: a job named '$name' is already running (codex-bg list); stop it or pick another --name" >&2; exit 3
+    fi
+  fi
+
+  # Create the files before showing a viewer, including when a heavy slot is pending.
+  mkdir -p -- "$(dirname -- "$log")"
+  : > "$log"
+  echo "state=starting" > "$status"
+  if command -v jq >/dev/null; then
+    jq -n --arg log "$log" --arg cwd "$PWD" '{log:$log,cwd:$cwd}' > "$STATE/$unit.json"
+  fi
+
+  if [[ $use_systemd == 1 ]]; then
+    local props=(--setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=LANG="${LANG:-C.UTF-8}" --setenv=PYTHONUNBUFFERED=1)
+    for key in "${envs[@]}"; do props+=(--setenv="$key"); done
+    systemd-run --user --quiet --collect --expand-environment=no --unit="$unit" --working-directory="$PWD" "${props[@]}" \
+      bash -c "$RUNNER" _ "$log" "$status" "$thread" "$codex" "$unit" "$name" "$heavy" "$mem" -- "$@"
+  else
+    # No user systemd: detach with setsid. No memory cap in this mode.
+    setsid nohup bash -c "$RUNNER" _ "$log" "$status" "$thread" "$codex" "$unit" "$name" "$heavy" "" -- "$@" \
+      > "$STATE/$unit.runner.log" 2>&1 < /dev/null &
+    disown || true
+  fi
+  echo "started $unit"
+  echo "log:    $log"
+  echo "status: $status"
+  echo "stop:   codex-bg stop $unit"
+  if [[ $no_pane == 0 && ${HERDR_ENV:-} == 1 ]]; then
+    cmd_pane "$unit" || echo "codex-bg: progress pane unavailable; background task is still running" >&2
+  fi
+  echo "Now end your turn. A '[codex-bg] $name finished' message will start your next turn."
+}
+
+case ${1:-} in
+  run) shift; cmd_run "$@" ;;
+  list) cmd_list ;;
+  stop) shift; cmd_stop "$@" ;;
+  pane) shift; cmd_pane "$@" ;;
+  watch) shift; cmd_watch "$@" ;;
+  -h|--help) usage 0 ;;
+  *) usage ;;
+esac

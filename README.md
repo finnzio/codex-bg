@@ -16,21 +16,29 @@ This project is an independent helper, not an official OpenAI product.
 
 ## Requirements
 
-- **Linux**, Bash 4+, GNU coreutils, and util-linux (`flock`, `setsid`). macOS and
-  Windows are not supported; Linux under WSL may work with user systemd enabled.
+- **Linux** (primary): Bash 4+, GNU coreutils, and util-linux (`flock`, `setsid`).
+  A working **user systemd** manager is recommended. `systemd-run` must support
+  `--expand-environment=no`. Check `systemctl --user is-system-running` and
+  `systemd-run --help`. A `degraded` user manager is also accepted. Linux under
+  WSL may work when user systemd is enabled.
+- **macOS** (launchd backend): Bash (the system 3.2 shell is enough for the
+  launcher), **Python 3.9+**, and `launchctl`. Jobs are registered as temporary
+  launchd services. **`--mem` is not supported** and exits with an error.
+  macOS support is **not personally Mac-tested**; verification is the GitHub
+  Actions `macos-latest` job (unit tests plus a live launchd smoke with a stub
+  `codex`). Windows is not supported.
 - A `codex` executable that supports `codex queue --thread … --message …`, plus
   `CODEX_THREAD_ID` from the active session. Check **`codex queue --help`** first:
   not every Codex build exposes this command. The helper does not add it.
-- A working **user systemd** manager is recommended. `systemd-run` must support
-  `--expand-environment=no`. Check `systemctl --user is-system-running` and
-  `systemd-run --help`. A `degraded` user manager is also accepted.
 - **jq** is recommended for metadata and custom log paths, and required for panes.
 - Optional **Herdr** with `HERDR_ENV=1`, `HERDR_PANE_ID`, and the `pane current`,
   `split`, `get`, `rename`, `run`, and `close` CLI commands. Pane integration has
   been exercised with Herdr 0.9.5.
-- Tests use Python 3.9+; live Linux tests use `os.pidfd_open`.
+- Tests use Python 3.9+. Live Linux Herdr tests use `os.pidfd_open` (Linux only).
 
-No Python or Node dependency is needed to run the helper.
+On Linux, no Python dependency is required to run the helper. On macOS, Python 3
+runs the launchd backend (`bin/codex-bg-macos.py`), which `install.sh` copies next
+to the launcher.
 
 ## Install
 
@@ -64,7 +72,7 @@ installed `codex-bg` file and `codex-bg` skill directory after stopping active j
 | --- | --- |
 | `run [options] -- command [args…]` | Launch a detached job from the current directory |
 | `list` | Show up to 20 recent status files |
-| `stop UNIT` | Stop a systemd job, mark it stopped, and send no completion wake |
+| `stop UNIT` | Stop a systemd/launchd job, mark it stopped, and send no completion wake |
 | `pane UNIT` | Open/reuse a Herdr progress pane in the caller's tab |
 | `watch UNIT` | Follow the log in the current terminal without closing it |
 
@@ -72,8 +80,8 @@ installed `codex-bg` file and `codex-bg` skill directory after stopping active j
 | --- | --- |
 | `--name NAME` | Short label; sanitized and timestamped into a unit name |
 | `--heavy` | Acquire one of two slots shared by the state directory |
-| `--mem 8G` | Limit the command's systemd scope; swap limit is zero |
-| `--env KEY` | Forward an environment variable by name to the systemd runner; repeatable |
+| `--mem 8G` | Limit the command's systemd scope; swap limit is zero (Linux only; errors on macOS) |
+| `--env KEY` | Forward an environment variable by name to the runner; repeatable |
 | `--log FILE` | Write command output to a custom path; install jq to use it with `watch` |
 | `--no-pane` | Disable automatic Herdr pane creation |
 
@@ -110,9 +118,13 @@ The default directory is temporary and can be removed on reboot.
 - Completion uses `codex queue`, with three delivery attempts. Accepted messages
   may remain queued while a session is busy or closed; acceptance does not prove
   the model resumed. This helper does not pass `--resume` or configure remote routing.
-- Without user systemd, `setsid` + `nohup` still detach execution, but **memory
-  limits, duplicate-name protection, and the `stop` command are not supported**.
-  Prefer systemd for managed jobs. The fallback inherits the launcher's environment.
+- Without user systemd on Linux, `setsid` + `nohup` still detach execution, but
+  **memory limits, duplicate-name protection, and the `stop` command are not
+  supported**. Prefer systemd for managed Linux jobs. The fallback inherits the
+  launcher's environment.
+- On macOS, launchd provides duplicate-name checks and `stop`. There is no
+  systemd-style memory cap (`--mem` is rejected). Heavy slots use Python
+  `fcntl.flock` instead of the `flock` CLI.
 - This is not a durable scheduler: no reboot recovery, automatic job retry,
   exactly-once notification, or hostile-code sandbox is provided. Do not launch
   commands with conflicting build outputs or database writes concurrently.
@@ -129,11 +141,13 @@ python3 -m unittest discover -s tests -v
 CODEX_BG_LIVE_HERDR=1 python3 -m unittest discover -s tests -v
 ```
 
-Unit tests stub external commands. Opt-in live tests create temporary systemd
-jobs and panes, verify auto-close and that manual pane closure leaves the job
-running, then clean them up. They replace the completion receiver with a local
-stub; they do not send messages to a real Codex thread. GitHub Actions runs the
-unit suite; it does not exercise a live Codex or Herdr session.
+Unit tests stub external commands (including a fake `launchctl` for the macOS
+backend). Opt-in live Linux tests create temporary systemd jobs and panes,
+verify auto-close and that manual pane closure leaves the job running, then
+clean them up. They replace the completion receiver with a local stub; they do
+not send messages to a real Codex thread. GitHub Actions runs the unit suite on
+`ubuntu-latest` and `macos-latest`; the macOS job also runs a live launchd smoke
+with a stub `codex`. Neither job exercises a live Codex or Herdr session.
 
 ## License
 

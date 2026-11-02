@@ -19,13 +19,14 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
-install -d -- "$bin_dir"
-install -m 0755 -- "$root/bin/codex-bg" "$bin_dir/codex-bg"
+mkdir -p "$bin_dir"
+install -m 0755 "$root/bin/codex-bg" "$bin_dir/codex-bg"
+install -m 0644 "$root/bin/codex-bg-macos.py" "$bin_dir/codex-bg-macos.py"
 printf 'Installed script: %s/codex-bg\n' "$bin_dir"
 if [[ $with_skill == 1 ]]; then
-  install -d -- "$skill_dir/codex-bg/agents"
-  install -m 0644 -- "$root/skills/codex-bg/SKILL.md" "$skill_dir/codex-bg/SKILL.md"
-  install -m 0644 -- "$root/skills/codex-bg/agents/openai.yaml" "$skill_dir/codex-bg/agents/openai.yaml"
+  mkdir -p "$skill_dir/codex-bg/agents"
+  install -m 0644 "$root/skills/codex-bg/SKILL.md" "$skill_dir/codex-bg/SKILL.md"
+  install -m 0644 "$root/skills/codex-bg/agents/openai.yaml" "$skill_dir/codex-bg/agents/openai.yaml"
   printf 'Installed skill: %s/codex-bg\n' "$skill_dir"
 fi
 printf 'Add %s to PATH if needed. No shell profile was changed.\n' "$bin_dir"

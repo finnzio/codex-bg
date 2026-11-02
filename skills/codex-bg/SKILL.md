@@ -13,8 +13,11 @@ do not replace it with an ad-hoc background runner.
 
 Run from the task's working directory, with `CODEX_THREAD_ID` supplied by the
 active Codex session. Confirm `codex queue --help` is available when setting up
-a new environment. User systemd is the supported mode for cancellation and
-memory limits; the setsid fallback has fewer controls.
+a new environment. On Linux, user systemd is the supported mode for cancellation
+and memory limits; the setsid fallback has fewer controls. On macOS, the
+launchd backend (Python 3 helper) supports cancellation and duplicate-name
+checks; **`--mem` is unsupported and errors**. macOS support is verified on
+GitHub Actions `macos-latest`, not on a personal Mac.
 
 ```bash
 codex-bg run --name build --heavy --mem 8G -- make build
@@ -47,7 +50,8 @@ codex-bg watch <unit>
 ```
 
 Use `list` once for an explicit progress request or a missing completion message.
-Cancellation via `stop` requires user systemd and does not send a completion wake.
+Cancellation via `stop` requires user systemd (Linux) or launchd (macOS) and
+does not send a completion wake.
 Queue acceptance does not prove the session resumed: a closed session may retain
 the message until reopened. Preserve the log/status paths when notification fails.
 

@@ -1,6 +1,6 @@
 ---
 name: codex-bg
-description: Run long, noninteractive commands outside a Codex turn and queue completion back to the originating thread. Use for builds, full test suites, imports, and batch jobs expected to take several minutes. Includes optional Herdr progress panes. Do not use for dev servers, interactive commands, or short checks.
+description: Run long, noninteractive commands outside a Codex turn and queue completion back to the originating thread. Use for builds, full test suites, imports, and batch jobs expected to take several minutes. Select optional hc progress terminals or herdr-tui panes from the current runtime context. Do not use for dev servers, interactive commands, or short checks.
 ---
 
 # codex-bg
@@ -21,7 +21,7 @@ GitHub Actions `macos-latest`, not on a personal Mac.
 
 ```bash
 codex-bg run --name build --heavy --mem 8G -- make build
-codex-bg run --name tests --heavy -- bash -lc 'PATH=$PWD/.venv/bin:$PATH make test'
+codex-bg run --name tests --heavy -- bash -c 'PATH=$PWD/.venv/bin:$PATH make test'
 codex-bg run --name import --env API_TOKEN -- ./scripts/import-data
 ```
 
@@ -30,6 +30,8 @@ participating jobs to two concurrent slots per state directory. Avoid overlappin
 jobs that write the same build output or database. Pass secret environment
 variable names with `--env KEY`, never their values in command arguments.
 Commands must not write secrets to their output.
+For shell syntax, prefer `bash -c` to preserve the launcher's PATH. A login
+shell (`bash -lc`) may hide the Node.js/pnpm toolchain by resetting PATH.
 
 After launching, report the returned unit and log path, then **end the turn**.
 Do not keep the turn alive with sleeps, repeated status checks, or `tail -f`.
@@ -55,10 +57,46 @@ does not send a completion wake.
 Queue acceptance does not prove the session resumed: a closed session may retain
 the message until reopened. Preserve the log/status paths when notification fails.
 
-## Herdr
+## Identify the control plane
+
+Before the first long command in a session, inspect the current shell context;
+repeat after changing terminals or resuming in another environment:
+
+```bash
+printf 'HC_TERMINAL_ID=%s HERDR_ENV=%s HERDR_PANE_ID=%s\n' "${HC_TERMINAL_ID:-}" "${HERDR_ENV:-}" "${HERDR_PANE_ID:-}"
+```
+
+Use the first matching context:
+
+| Context | Action |
+| --- | --- |
+| Nonempty `HC_TERMINAL_ID` | Read `hc --skill` and validate `hc get "$HC_TERMINAL_ID"`; hc takes precedence over herdr-tui variables |
+| No hc context, `HERDR_ENV=1` and nonempty `HERDR_PANE_ID` | Read `herdr --skill`; use the herdr-tui viewer |
+| Neither | Keep detached execution and logs; do not select another client's terminal or pane |
+
+Installed commands do not establish the active control plane. If hc caller
+validation fails, use `--no-pane` and report unavailable progress viewing;
+do not fall back to a herdr-tui session. Keep using `codex-bg` for the task
+in every environment.
+
+## hc terminals
+
+With `HC_TERMINAL_ID`, `run` opens only a read-only `watch` child terminal.
+Use its returned `hc attach <terminal>` command to view progress. hc does
+not arrange windows. Codex inside hc must start with `--no-daemon`.
+
+Let the helper create and reuse its viewer; do not launch the workload through
+`hc run` or register a second completion watcher for the progress terminal.
+The independent runner still delivers completion through `codex queue`.
+Closing the viewer does not cancel the task. After success, failure or explicit
+stop, event waits collect its exit and remove the automatic terminal. Match
+worker addresses carefully if also using `hc wait --children`: log viewers
+are children too. Manual `watch` never closes the caller's terminal.
+
+## herdr-tui panes
 
 With `HERDR_ENV=1` and `HERDR_PANE_ID`, `run` opens a progress pane to the right
-of the caller in the same tab, preserving focus. Read `herdr --skill` before
+of the caller in the same tab, preserving focus, when there is no hc context. Read `herdr --skill` before
 direct pane operations. Let the helper create its viewer; do not create a second
 pane or run the workload in that pane.
 

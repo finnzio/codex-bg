@@ -1,4 +1,4 @@
-"""Exercise detached launch, caller-specific Herdr layout, and read-only viewing."""
+"""Exercise detached launch, hc/herdr-tui viewers, and read-only viewing."""
 
 import json
 import os
@@ -28,11 +28,37 @@ if name == 'herdr':
         sys.exit(1)
     pane = 'w1:p1' if args[:2] == ['pane', 'current'] else 'w1:p2'
     print(json.dumps({'result': {'pane': {'pane_id': pane, 'tab_id': 'w1:t1'}}}))
+if name == 'hc':
+    viewer = pathlib.Path(os.environ['TEST_TRACE']).with_suffix('.viewer.json')
+    if args[0] == 'run':
+        if os.environ.get('FAIL_HC_RUN'):
+            sys.exit(1)
+        data = {'address': 'tviewer', 'state': 'live',
+                'parent': args[args.index('--parent') + 1], 'labels': {}}
+        for i, arg in enumerate(args):
+            if arg == '--label':
+                key, value = args[i + 1].split('=', 1)
+                data['labels'][key] = value
+        viewer.write_text(json.dumps(data))
+        print(json.dumps(data))
+    elif args[0] == 'get':
+        if args[1] == 'tcaller':
+            print(json.dumps({'address': 'tcaller', 'state': 'live'}))
+        elif args[1] == 'tviewer' and viewer.exists():
+            data = json.loads(viewer.read_text())
+            if os.environ.get('HC_VIEWER_STATE'):
+                data['state'] = os.environ['HC_VIEWER_STATE']
+            if os.environ.get('HC_VIEWER_PARENT'):
+                data['parent'] = os.environ['HC_VIEWER_PARENT']
+            if os.environ.get('HC_VIEWER_UNIT'):
+                data['labels']['codex-bg.unit'] = os.environ['HC_VIEWER_UNIT']
+            print(json.dumps(data))
+        else:
+            sys.exit(3)
 '''
 
 
-@unittest.skipIf(IS_DARWIN, "systemd launch path; macOS coverage is in test_macos.py")
-class CodexBgTests(unittest.TestCase):
+class CodexBgFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="codex-bg-test-")
         self.addCleanup(self.temp.cleanup)
@@ -41,7 +67,7 @@ class CodexBgTests(unittest.TestCase):
         self.bin.mkdir()
         self.state = self.root / "state"
         self.trace = self.root / "trace.jsonl"
-        for name in ("systemctl", "systemd-run", "codex", "herdr"):
+        for name in ("systemctl", "systemd-run", "codex", "herdr", "hc"):
             path = self.bin / name
             path.write_text(STUB)
             path.chmod(0o755)
@@ -53,6 +79,7 @@ class CodexBgTests(unittest.TestCase):
             "CODEX_THREAD_ID": "test-thread",
             "HERDR_ENV": "1",
             "HERDR_PANE_ID": "w1:p1",
+            "HC_TERMINAL_ID": "",
         }
 
     def run_tool(self, *args, **overrides):
@@ -73,6 +100,8 @@ class CodexBgTests(unittest.TestCase):
         unit = result.stdout.splitlines()[0].removeprefix("started ")
         return unit, result
 
+@unittest.skipIf(IS_DARWIN, "systemd launch path; macOS coverage is in test_macos.py")
+class CodexBgTests(CodexBgFixture):
     def test_launches_task_outside_right_pane_without_stealing_focus(self):
         unit, _ = self.launch()
         self.assertEqual(len(self.calls("systemd-run")), 1)
@@ -164,8 +193,198 @@ class CodexBgTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
 
 
+
+    def test_hc_viewer_keeps_task_detached_and_takes_priority_over_herdr_tui(self):
+        unit, result = self.launch(HC_TERMINAL_ID="tcaller")
+        self.assertEqual(len(self.calls("systemd-run")), 1)
+        self.assertEqual(self.calls("herdr"), [])
+        view = next(call for call in self.calls("hc") if call[1] == "run")
+        self.assertEqual(view[2:9], ["--bg", "--rm", "--no-notify", "--parent", "tcaller", "--cwd", str(self.root)])
+        self.assertEqual(view[-5:], ["env", f"CODEX_BG_STATE_DIR={self.state}", str(SCRIPT), "watch", unit])
+        self.assertNotIn("task-marker", view)
+        self.assertIn("progress terminal: tviewer", result.stdout)
+        self.assertEqual(json.loads((self.state / (unit + ".json")).read_text())["terminal_id"], "tviewer")
+
+    def test_hc_existing_viewer_is_reused(self):
+        unit, _ = self.launch(HC_TERMINAL_ID="tcaller")
+        result = self.run_tool("pane", unit, HC_TERMINAL_ID="tcaller")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already open", result.stdout)
+        self.assertEqual(sum(call[1] == "run" for call in self.calls("hc")), 1)
+
+    def test_hc_finished_or_unrelated_viewer_is_not_reused(self):
+        for override in ({"HC_VIEWER_STATE": "finished"}, {"HC_VIEWER_PARENT": "tother"},
+                         {"HC_VIEWER_UNIT": "another-job"}):
+            with self.subTest(override=override):
+                unit, _ = self.launch(HC_TERMINAL_ID="tcaller")
+                self.trace.write_text("")
+                result = self.run_tool("pane", unit, HC_TERMINAL_ID="tcaller", **override)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(sum(call[1] == "run" for call in self.calls("hc")), 1)
+                self.assertFalse(any(call[1] in ("kill", "rm") for call in self.calls("hc")))
+
+    def test_hc_failure_does_not_restart_task_or_fall_back_to_herdr_tui(self):
+        _, result = self.launch(HC_TERMINAL_ID="tcaller", FAIL_HC_RUN="1")
+        self.assertEqual(len(self.calls("systemd-run")), 1)
+        self.assertEqual(self.calls("herdr"), [])
+        self.assertIn("background task is still running", result.stderr)
+
+    def test_hc_requires_a_live_caller_and_does_not_use_focused_terminal(self):
+        _, result = self.launch(HC_TERMINAL_ID="tmissing")
+        self.assertEqual(len(self.calls("systemd-run")), 1)
+        self.assertEqual(self.calls("herdr"), [])
+        self.assertFalse(any(call[1] == "run" for call in self.calls("hc")))
+        self.assertIn("background task is still running", result.stderr)
+
+    def test_hc_explicit_opt_out_never_creates_viewer(self):
+        self.launch("--no-pane", HC_TERMINAL_ID="tcaller")
+        self.assertEqual(self.calls("hc"), [])
+        self.assertEqual(self.calls("herdr"), [])
+
+    def test_hc_manual_watch_never_controls_terminal(self):
+        unit, _ = self.launch("--no-pane", HC_TERMINAL_ID="tcaller")
+        (self.state / (unit + ".status")).write_text("state=finished exit=0\n")
+        result = self.run_tool("watch", unit, HC_TERMINAL_ID="tcaller")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls("hc"), [])
+
+    def test_hc_legacy_job_gains_viewer_metadata(self):
+        self.state.mkdir()
+        unit = "codex-bg-legacy-20260101-000000"
+        (self.state / (unit + ".status")).write_text("state=running\n")
+        (self.state / (unit + ".log")).write_text("legacy progress\n")
+        self.assertEqual(self.run_tool("pane", unit, HC_TERMINAL_ID="tcaller").returncode, 0)
+        self.assertIn("already open", self.run_tool("pane", unit, HC_TERMINAL_ID="tcaller").stdout)
+
+    def test_hc_passes_custom_state_directory_as_literal_argument(self):
+        state = self.root / "$(touch INJECTED) state"
+        unit, _ = self.launch(HC_TERMINAL_ID="tcaller", CODEX_BG_STATE_DIR=str(state))
+        view = next(call for call in self.calls("hc") if call[1] == "run")
+        self.assertEqual(view[-5:], ["env", f"CODEX_BG_STATE_DIR={state}", str(SCRIPT), "watch", unit])
+        self.assertFalse((self.root / "INJECTED").exists())
+
+
+
+class HcViewerPlatformTests(CodexBgFixture):
+    def test_darwin_viewer_preserves_launchd_metadata_without_setsid(self):
+        uname = self.bin / "uname"
+        uname.write_text("#!/bin/sh\necho Darwin\n")
+        uname.chmod(0o755)
+        setsid = self.bin / "setsid"
+        setsid.write_text(STUB)
+        setsid.chmod(0o755)
+        self.state.mkdir()
+        unit = "codex-bg-macos-20260101-000000"
+        log = self.state / (unit + ".log")
+        log.write_text("launchd progress\n")
+        (self.state / (unit + ".status")).write_text("state=running\n")
+        metadata = self.state / (unit + ".json")
+        metadata.write_text(json.dumps({"log": str(log), "cwd": str(self.root), "backend": "launchd"}))
+        result = self.run_tool("pane", unit, HC_TERMINAL_ID="tcaller")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("progress terminal: tviewer", result.stdout)
+        self.assertEqual(self.calls("setsid"), [])
+        self.assertEqual(self.calls("herdr"), [])
+        self.assertEqual(self.calls("systemd-run"), [])
+        self.assertEqual(json.loads(metadata.read_text())["backend"], "launchd")
+
+@unittest.skipUnless(os.environ.get("CODEX_BG_LIVE_HC") == "1", "opt-in live hc/systemd check")
+@unittest.skipUnless(sys.platform.startswith("linux"), "live hc/systemd checks need Linux pidfd")
+class CodexBgLiveHcTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(os.environ.get("HC_TERMINAL_ID"))
+        temp = tempfile.TemporaryDirectory(prefix="codex-bg-live-hc-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        binary = self.root / "bin"
+        binary.mkdir()
+        self.wake = self.root / "wake"
+        codex = binary / "codex"
+        codex.write_text("#!/bin/bash\nprintf '%s\\n' \"$*\" >> " + shlex.quote(str(self.wake)) + "\n")
+        codex.chmod(0o755)
+        self.state = self.root / "state"
+        self.env = {**os.environ, "PATH": str(binary) + os.pathsep + os.environ["PATH"],
+                    "CODEX_THREAD_ID": "local-hc-test", "CODEX_BG_STATE_DIR": str(self.state)}
+
+    def launch(self, command, *options):
+        result = subprocess.run(
+            [str(SCRIPT), "run", "--name", "hc-test-" + uuid.uuid4().hex[:8], *options,
+             "--", "bash", "-c", command], cwd=self.root, env=self.env,
+            capture_output=True, text=True, check=True, timeout=15,
+        )
+        unit = result.stdout.splitlines()[0].removeprefix("started ")
+        terminal = json.loads((self.state / (unit + ".json")).read_text())["terminal_id"]
+        self.addCleanup(subprocess.run, ["hc", "rm", terminal], capture_output=True)
+        self.addCleanup(subprocess.run, ["hc", "kill", terminal], capture_output=True)
+        self.addCleanup(subprocess.run, ["systemctl", "--user", "stop", unit], capture_output=True)
+        return unit, terminal
+
+    def wait_runner(self, unit):
+        pid = int(subprocess.check_output(
+            ["systemctl", "--user", "show", unit, "-p", "MainPID", "--value"], text=True,
+        ))
+        if pid:
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            try:
+                ready, _, _ = select.select([fd], [], [], 15)
+                self.assertTrue(ready, "detached runner did not finish")
+            finally:
+                os.close(fd)
+
+    def assert_viewer_removed(self, terminal):
+        # An event wait collects --rm terminals; another waiter may already
+        # have removed this viewer. Never poll or inspect other terminals.
+        result = subprocess.run(["hc", "wait", terminal, "--timeout", "10"],
+                                capture_output=True, text=True, timeout=12)
+        self.assertIn(result.returncode, (0, 3), result.stdout + result.stderr)
+        result = subprocess.run(["hc", "get", terminal], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+
+    def test_completion_removes_viewer_and_delivers_one_wake_on_success_and_failure(self):
+        for code in (0, 7):
+            with self.subTest(code=code):
+                self.wake.unlink(missing_ok=True)
+                unit, terminal = self.launch(f"printf 'live-hc-start\\n'; sleep 2; exit {code}")
+                viewer = json.loads(subprocess.check_output(["hc", "get", terminal], text=True))
+                self.assertEqual(viewer["parent"], os.environ["HC_TERMINAL_ID"])
+                self.assertFalse(viewer["notify"])
+                self.assertEqual(viewer["labels"]["codex-bg.unit"], unit)
+                self.wait_runner(unit)
+                self.assert_viewer_removed(terminal)
+                self.assertIn(f"state=finished exit={code}", (self.state / (unit + ".status")).read_text())
+                self.assertEqual(len(self.wake.read_text().splitlines()), 1)
+                self.assertIn(f"exit={code}", self.wake.read_text())
+
+    def test_closing_hc_viewer_does_not_interrupt_task_or_wake(self):
+        unit, terminal = self.launch("printf 'start\\n'; sleep 3; printf 'after-viewer-close\\n'", "--mem", "128M")
+        viewer = json.loads(subprocess.check_output(["hc", "get", terminal], text=True))
+        self.assertEqual(viewer["state"], "live")
+        result = subprocess.run(["hc", "kill", terminal], capture_output=True, text=True, timeout=5)
+        # --rm plus the exit collector can remove a killed terminal before
+        # kill's final lookup. not_found then means cleanup already won.
+        self.assertIn(result.returncode, (0, 3), result.stdout + result.stderr)
+        subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit], check=True)
+        self.wait_runner(unit)
+        self.assert_viewer_removed(terminal)
+        self.assertIn("after-viewer-close", (self.state / (unit + ".log")).read_text())
+        self.assertIn("state=finished exit=0", (self.state / (unit + ".status")).read_text())
+        self.assertEqual(len(self.wake.read_text().splitlines()), 1)
+
+    def test_explicit_stop_removes_viewer_without_wake(self):
+        unit, terminal = self.launch("printf 'start\\n'; sleep 30")
+        subprocess.run([str(SCRIPT), "stop", unit], env=self.env,
+                       capture_output=True, check=True, timeout=10)
+        self.assert_viewer_removed(terminal)
+        self.assertIn("state=stopped", (self.state / (unit + ".status")).read_text())
+        self.assertFalse(self.wake.exists())
+
+
 @unittest.skipUnless(os.environ.get("CODEX_BG_LIVE_HERDR") == "1", "opt-in live Herdr/systemd check")
 @unittest.skipUnless(sys.platform.startswith("linux"), "live systemd/Herdr checks need Linux pidfd and user systemd")
+@unittest.skipIf(bool(os.environ.get("HC_TERMINAL_ID")), "herdr-tui live checks require herdr-tui context")
 class CodexBgLiveTests(unittest.TestCase):
     def test_finished_job_automatically_closes_only_its_progress_pane(self):
         with tempfile.TemporaryDirectory(prefix="codex-bg-live-close-") as directory:

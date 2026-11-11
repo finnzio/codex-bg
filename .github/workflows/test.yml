@@ -20,6 +20,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install hc viewer test prerequisite
+        run: command -v jq >/dev/null || brew install jq
       - name: Show bash version
         run: /bin/bash --version | head -1
       - name: Shell syntax (system bash 3.2)

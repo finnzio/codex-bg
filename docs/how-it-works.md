@@ -19,11 +19,16 @@ flowchart TD
     F --> G[Write finished status and exit code]
     G --> H[codex queue to originating thread]
     H --> I[Codex reads log and continues]
-    A -. optional Herdr .-> J[Caller tab: right-hand progress pane]
+    A -. optional viewer .-> V{Runtime context}
+    V -->|HC_TERMINAL_ID| J[Read-only hc child terminal]
+    V -->|herdr-tui context only| T[Caller tab: right-hand progress pane]
     F --> K[Log file]
     K -. read only .-> J
+    K -. read only .-> T
     G -. terminal state .-> J
-    J --> L[Stop tail and close own pane ID]
+    G -. terminal state .-> T
+    J --> L[Stop tail; hc wait collects and removes terminal]
+    T --> U[Stop tail and close own pane ID]
 ```
 
 ## 1. Launch and identity
@@ -32,7 +37,7 @@ flowchart TD
 `codex` executable, and command arguments. It sanitizes the label and appends a
 second-resolution timestamp to form `codex-bg-NAME-YYYYMMDD-HHMMSS`.
 
-The launcher creates the log and starting status **before** opening a pane.
+The launcher creates the log and starting status **before** opening a viewer.
 In systemd and launchd modes it rejects an already-active job with the same
 label. This check is not an atomic, global scheduler lock; avoid concurrent
 launches of the same name. The Linux setsid fallback has no duplicate-name check.
@@ -43,7 +48,7 @@ Each job stores:
 | --- | --- |
 | `UNIT.log` (or `--log`) | Command stdout and stderr |
 | `UNIT.status` | First line: lifecycle status; subsequent lines may contain queue output |
-| `UNIT.json` | Log path, launch directory, backend metadata, and optional pane ID |
+| `UNIT.json` | Log path, launch directory, backend metadata, and optional terminal/pane ID |
 | `UNIT.plist` / `UNIT.launch.json` | macOS launchd job definition and runner config (removed on `stop`) |
 | `UNIT.runner.log` | Runner diagnostics (setsid fallback or launchd helper stdout/stderr) |
 | `heavy.N.lock` | Shared file locks for participating heavy jobs |
@@ -100,10 +105,36 @@ Write the finished status to disk before notifying; a failed wake does not erase
 the command result. When a delayed message arrives, confirm the unit against
 prior work before rerunning.
 
-## 4. Herdr pane ownership
+## 4. Viewer ownership
 
-The launcher uses the caller's Herdr context and splits to the right, preserving
-tab, directory, and focus. It reads the new pane ID from Herdr's JSON response,
+The current shell selects the viewer. A nonempty `HC_TERMINAL_ID` takes
+precedence; otherwise `HERDR_ENV=1` plus `HERDR_PANE_ID` selects herdr-tui.
+Neither context means detached logs only. Installed binaries do not select a
+control plane.
+
+### hc terminals
+
+The launcher validates its caller with `hc get`, then starts a read-only child
+using `hc run --bg --rm --no-notify --parent <caller>`. The metadata records
+the returned `terminal_id`. A live terminal is reused only if its parent,
+`codex-bg.unit`, and `codex-bg.role=viewer` labels match. An invalid caller
+or failed viewer does not fall back to another herdr-tui session.
+
+The child runs only `watch`. A detached collector waits for its exit with
+`hc wait`, renewing waits after timeout/message check-ins without model calls.
+When `watch` observes `finished` or `stopped`, it exits; the collector obtains
+the exit and hc removes the `--rm` terminal. Linux detaches the collector with
+`setsid`/`nohup`, while macOS uses `nohup`/`disown`. The latter requires no
+GNU `setsid` and preserves the launchd workload's independent lifetime.
+
+Closing a viewer early does not cancel the systemd/launchd task. Its
+`--no-notify` suppresses duplicate parent notes; `codex queue` still reports
+the actual task result. hc manages terminals rather than window placement.
+
+### herdr-tui panes
+
+The launcher uses the caller's herdr-tui context and splits to the right, preserving
+tab, directory, and focus. It reads the new pane ID from herdr-tui's JSON response,
 stores it in metadata, and passes that exact ID to the viewer. It never chooses
 another client's focused pane as a fallback.
 

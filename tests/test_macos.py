@@ -103,6 +103,7 @@ class MacosHelperTests(unittest.TestCase):
             "CODEX_BG_STATE_DIR": str(self.state),
             "CODEX_THREAD_ID": "mac-thread",
             "HERDR_ENV": "0",
+            "HC_TERMINAL_ID": "",
         }
         # Direct helper.launch calls read process env, not subprocess env.
         previous = {key: os.environ.get(key) for key in (
@@ -311,6 +312,7 @@ class MacosLiveLaunchdTests(unittest.TestCase):
                 "CODEX_THREAD_ID": "live-mac",
                 "CODEX_BG_STATE_DIR": str(state),
                 "HERDR_ENV": "0",
+                "HC_TERMINAL_ID": "",
             }
             finished = subprocess.run(
                 [str(SCRIPT), "run", "--name", "liveok", "--no-pane", "--",

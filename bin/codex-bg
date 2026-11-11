@@ -5,7 +5,7 @@
 #   codex-bg run [--name N] [--heavy] [--mem 8G] [--env KEY]... [--log FILE] [--no-pane] -- CMD [ARG]...
 #   codex-bg list
 #   codex-bg stop UNIT
-#   codex-bg pane UNIT    # Show an existing job in a Herdr pane on the right
+#   codex-bg pane UNIT    # Show an existing job in an hc terminal or herdr-tui pane
 #   codex-bg watch UNIT   # Read-only foreground progress viewer
 #
 # Needs CODEX_THREAD_ID (Codex sets it in every shell command).
@@ -59,7 +59,7 @@ cmd_watch() (
   # Only an automatically launched viewer may close its own pane. Never fall
   # back to the focused pane or a job's metadata (another viewer may replace it).
   if [[ -n $close_pane && ( ${HERDR_ENV:-} != 1 || $close_pane != "${HERDR_PANE_ID:-}" ) ]]; then
-    echo "codex-bg: viewer pane does not match the current Herdr pane" >&2; exit 2
+    echo "codex-bg: viewer pane does not match the current herdr-tui pane" >&2; exit 2
   fi
   log=$(job_log "$unit")
   status="$STATE/$unit.status"
@@ -94,12 +94,63 @@ cmd_watch() (
   done
 )
 
+cmd_hc_viewer() {
+  local unit=$1 current response terminal_id metadata cwd
+  command -v hc >/dev/null && command -v jq >/dev/null || {
+    echo "codex-bg: hc/jq unavailable; task continues without a progress terminal" >&2; return 1;
+  }
+  current=$(hc get "$HC_TERMINAL_ID") || return
+  jq -e --arg caller "$HC_TERMINAL_ID" '.address == $caller and .state == "live"' <<< "$current" >/dev/null || return 1
+  metadata="$STATE/$unit.json"
+  if [[ ! -f $metadata ]]; then
+    jq -n --arg log "$(job_log "$unit")" --arg cwd "$PWD" '{log:$log,cwd:$cwd}' > "$metadata" || return
+  fi
+  terminal_id=$(jq -r '.terminal_id // empty' "$metadata") || return
+  if [[ -n $terminal_id ]] && response=$(hc get "$terminal_id" 2>/dev/null) &&
+    jq -e --arg caller "$HC_TERMINAL_ID" --arg unit "$unit" \
+      '.state == "live" and .parent == $caller and .labels["codex-bg.unit"] == $unit and .labels["codex-bg.role"] == "viewer"' \
+      <<< "$response" >/dev/null; then
+    echo "progress terminal: $terminal_id (already open; hc attach $terminal_id)"
+    return 0
+  fi
+  cwd=$(jq -er '.cwd' "$metadata") || return
+  # hc owns only the reader; systemd/launchd still owns the independent task.
+  response=$(hc run --bg --rm --no-notify --parent "$HC_TERMINAL_ID" --cwd "$cwd" \
+    --label "codex-bg.unit=$unit" --label codex-bg.role=viewer \
+    env "CODEX_BG_STATE_DIR=$STATE" "$SCRIPT_PATH" watch "$unit") || return
+  terminal_id=$(jq -er '.address' <<< "$response") || return
+  jq --arg terminal "$terminal_id" '.terminal_id = $terminal' "$metadata" > "$metadata.tmp" || return
+  mv -- "$metadata.tmp" "$metadata" || return
+  # Renew event waits on check-ins/messages without model polling. macOS has
+  # no setsid command; nohup plus disown detaches its read-only collector.
+  local collector=(nohup)
+  if [[ $PLATFORM != Darwin ]]; then collector=(setsid nohup); fi
+  "${collector[@]}" bash -c '
+    while result=$(hc wait "$1" --timeout 3600 2>/dev/null); do
+      jq -e '\''.reason == "timeout" or .reason == "message"'\'' <<< "$result" >/dev/null || break
+    done
+  ' _ "$terminal_id" >/dev/null 2>&1 < /dev/null &
+  disown || true
+  echo "progress terminal: $terminal_id (hc attach $terminal_id; auto-removes when finished; closing it does not stop the task)"
+}
+
 cmd_pane() {
+  local unit=${1:?unit name required}
+  validate_unit "$unit" || return
+  [[ -f $STATE/$unit.status ]] || { echo "codex-bg: job not found: $unit" >&2; return 2; }
+  if [[ -n ${HC_TERMINAL_ID:-} ]]; then
+    cmd_hc_viewer "$unit"
+  else
+    cmd_herdr_tui_pane "$unit"
+  fi
+}
+
+cmd_herdr_tui_pane() {
   local unit=${1:?unit name required} current response pane_id watch_cmd metadata
   validate_unit "$unit" || return
   # Never use another client's focused pane as a fallback.
   [[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] || {
-    echo "codex-bg: no Herdr caller pane; task continues without a progress pane" >&2; return 1;
+    echo "codex-bg: no herdr-tui caller pane; task continues without a progress pane" >&2; return 1;
   }
   command -v herdr >/dev/null && command -v jq >/dev/null || {
     echo "codex-bg: herdr/jq unavailable; task continues without a progress pane" >&2; return 1;
@@ -256,7 +307,7 @@ cmd_run() {
   echo "log:    $log"
   echo "status: $status"
   echo "stop:   codex-bg stop $unit"
-  if [[ $no_pane == 0 && ${HERDR_ENV:-} == 1 ]]; then
+  if [[ $no_pane == 0 && ( -n ${HC_TERMINAL_ID:-} || ${HERDR_ENV:-} == 1 ) ]]; then
     cmd_pane "$unit" || echo "codex-bg: progress pane unavailable; background task is still running" >&2
   fi
   echo "Now end your turn. A '[codex-bg] $name finished' message will start your next turn."

@@ -19,11 +19,16 @@ flowchart TD
     F --> G[Write finished status and exit code]
     G --> H[codex queue to originating thread]
     H --> I[Codex reads log and continues]
-    A -. optional Herdr .-> J[Caller tab: right-hand progress pane]
+    A -. optional viewer .-> V{Runtime context}
+    V -->|HC_TERMINAL_ID| J[Read-only hc child terminal]
+    V -->|herdr-tui context only| T[Caller tab: right-hand progress pane]
     F --> K[Log file]
     K -. read only .-> J
+    K -. read only .-> T
     G -. terminal state .-> J
-    J --> L[Stop tail and close own pane ID]
+    G -. terminal state .-> T
+    J --> L[Stop tail; hc wait collects and removes terminal]
+    T --> U[Stop tail and close own pane ID]
 ```
 
 ## 1. 启动与身份
@@ -31,7 +36,7 @@ flowchart TD
 `run` 会捕获 `CODEX_THREAD_ID`、当前工作目录、解析到的 `codex` 可执行文件，以及命令参数。
 短名经过清洗后，再附上秒级时间戳，形成 `codex-bg-NAME-YYYYMMDD-HHMMSS`。
 
-启动器在打开进度窗格**之前**先创建日志和起始状态。
+启动器在打开进度查看器**之前**先创建日志和起始状态。
 在 systemd 与 launchd 模式下，若同名任务仍在运行会拒绝启动。
 这不是全局原子调度锁；请避免并发启动同名任务。Linux 的 setsid 退回路径没有重名检查。
 
@@ -41,7 +46,7 @@ flowchart TD
 | --- | --- |
 | `UNIT.log`（或 `--log`） | 命令的标准输出与标准错误 |
 | `UNIT.status` | 首行为生命周期状态；后续行可能含 queue 输出 |
-| `UNIT.json` | 日志路径、启动目录、后端元数据，以及可选的 pane ID |
+| `UNIT.json` | 日志路径、启动目录、后端元数据，以及可选的 terminal/pane ID |
 | `UNIT.plist` / `UNIT.launch.json` | macOS launchd 任务定义与 runner 配置（`stop` 时删除） |
 | `UNIT.runner.log` | runner 诊断日志（setsid 退回或 launchd helper 的 stdout/stderr） |
 | `heavy.N.lock` | 参与 heavy 限制的共享文件锁 |
@@ -89,10 +94,31 @@ queue 成功可以伴随一次失败的测试命令。
 完成状态先写入磁盘，通知后发送；通知失败不抹掉任务结果。
 收到延迟通知时应先核对 unit，不要把已经处理过的失败当成新的失败而盲目重跑。
 
-## 4. Herdr 窗格归属
+## 4. 查看器归属
 
-启动器使用调用者的 Herdr 上下文，在右侧拆分窗格，并保持 tab、目录与焦点。
-它从 Herdr 的 JSON 响应读取新 pane ID，写入元数据，并把这个确切 ID 交给查看器。
+按当前 shell 上下文选择查看器：优先使用非空的 `HC_TERMINAL_ID`，无 hc 上下文时才按
+`HERDR_ENV=1` 与 `HERDR_PANE_ID` 选择 herdr-tui。两者都没有时仅保留后台日志，
+不凭已安装的命令选择控制平面。
+
+### hc 终端
+
+启动器先用 `hc get` 验证调用者，再通过 `hc run --bg --rm --no-notify --parent <调用者>`
+启动只读子终端，把返回的 `terminal_id` 写入元数据。只有存活状态、父终端、`codex-bg.unit`
+与 `codex-bg.role=viewer` 标签都匹配时才复用。调用者验证或查看器创建失败时，
+不会回退到另一个 herdr-tui 会话。
+
+子终端只运行 `watch`。独立收集器用 `hc wait` 等待退出；超时或收到消息提前返回时重新挂起等待，
+不调用模型。`watch` 观察到 `finished` 或 `stopped` 后退出，收集器取得退出结果，hc 清理 `--rm`
+终端。Linux 收集器使用 `setsid`/`nohup`，macOS 使用 `nohup`/`disown`，不依赖 GNU `setsid`，
+任务仍保持独立的 launchd 生命周期。
+
+提前关闭查看器不会取消 systemd/launchd 任务。查看器的 `--no-notify` 禁用额外的父终端通知，
+任务结果仍由 `codex queue` 发送。hc 管理终端，窗口位置由查看应用决定。
+
+### herdr-tui 窗格
+
+启动器使用调用者的 herdr-tui 上下文，在右侧拆分窗格，并保持 tab、目录与焦点。
+它从 herdr-tui 的 JSON 响应读取新 pane ID，写入元数据，并把这个确切 ID 交给查看器。
 绝不会拿另一个客户端当前聚焦的窗格做回退。
 
 窗格里只跑 `watch`：跟随日志并采样状态文件。

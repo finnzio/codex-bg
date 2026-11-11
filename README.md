@@ -3,7 +3,7 @@
 [中文](README.zh-CN.md) · [How it works](docs/how-it-works.md) · [Agent skill](skills/codex-bg/SKILL.md)
 
 Run a long command outside the active Codex turn, then queue its result back to
-the same thread. Optional Herdr panes show real logs and close automatically
+the same thread. Optional hc terminals or herdr-tui panes show real logs and close automatically
 when the task finishes. The background wait does not require model polling.
 
 ```bash
@@ -31,7 +31,10 @@ This project is an independent helper, not an official OpenAI product.
   `CODEX_THREAD_ID` from the active session. Check **`codex queue --help`** first:
   not every Codex build exposes this command. The helper does not add it.
 - **jq** is recommended for metadata and custom log paths, and required for panes.
-- Optional **Herdr** with `HERDR_ENV=1`, `HERDR_PANE_ID`, and the `pane current`,
+- Optional **herdr-core (`hc`)** with `HC_TERMINAL_ID`, `hc get`, `hc run`, and
+  `hc wait`. hc integration is verified locally with hc 0.1.20 on Linux.
+  Codex in hc must start with `--no-daemon`.
+- Optional **herdr-tui (`herdr`)** with `HERDR_ENV=1`, `HERDR_PANE_ID`, and the `pane current`,
   `split`, `get`, `rename`, `run`, and `close` CLI commands. Pane integration has
   been exercised with Herdr 0.9.5.
 - Tests use Python 3.9+. Live Linux Herdr tests use `os.pidfd_open` (Linux only).
@@ -73,7 +76,7 @@ installed `codex-bg` file and `codex-bg` skill directory after stopping active j
 | `run [options] -- command [args…]` | Launch a detached job from the current directory |
 | `list` | Show up to 20 recent status files |
 | `stop UNIT` | Stop a systemd/launchd job, mark it stopped, and send no completion wake |
-| `pane UNIT` | Open/reuse a Herdr progress pane in the caller's tab |
+| `pane UNIT` | Open/reuse an hc progress terminal or herdr-tui pane |
 | `watch UNIT` | Follow the log in the current terminal without closing it |
 
 | Run option | Meaning |
@@ -83,12 +86,12 @@ installed `codex-bg` file and `codex-bg` skill directory after stopping active j
 | `--mem 8G` | Limit the command's systemd scope; swap limit is zero (Linux only; errors on macOS) |
 | `--env KEY` | Forward an environment variable by name to the runner; repeatable |
 | `--log FILE` | Write command output to a custom path; install jq to use it with `watch` |
-| `--no-pane` | Disable automatic Herdr pane creation |
+| `--no-pane` | Disable automatic hc terminals and herdr-tui panes |
 
 ```bash
 codex-bg run --name build --heavy --mem 8G -- make build
 codex-bg run --name import --env API_TOKEN -- ./scripts/import-data
-codex-bg run --name check --no-pane -- bash -lc 'PATH=$PWD/.venv/bin:$PATH make check'
+codex-bg run --name check --no-pane -- bash -c 'PATH=$PWD/.venv/bin:$PATH make check'
 codex-bg list
 # Use the exact unit returned by run/list:
 codex-bg stop codex-bg-check-20261102-120000
@@ -96,9 +99,37 @@ codex-bg stop codex-bg-check-20261102-120000
 
 Pass commands as arguments after `--`. Use an explicit shell only when shell
 syntax is needed. Pass secret **names** with `--env`, not secret values in argv.
+Use `bash -c` when the command relies on the launcher's PATH; a login shell
+(`bash -lc`) can reset it and hide tools such as Node.js or pnpm.
 Output is saved verbatim: the helper does not redact secrets printed by commands.
 
-## Herdr progress panes
+## Control plane and progress viewers
+
+The current runtime context selects the viewer; installed commands alone do
+not establish the control plane. `HC_TERMINAL_ID` takes precedence when both
+hc and herdr-tui variables exist.
+
+| Context | Viewer |
+| --- | --- |
+| Nonempty `HC_TERMINAL_ID` | Read-only hc child terminal; use the returned `hc attach <terminal>` command |
+| No hc context, `HERDR_ENV=1` and nonempty `HERDR_PANE_ID` | herdr-tui pane in the caller's tab |
+| Neither | Detached execution with log files |
+
+In hc, the launcher validates its caller and starts only `codex-bg watch`
+with `--bg --rm --no-notify --parent <caller>`. It reuses a live viewer only
+when the parent and job labels match. A detached `hc wait` collector renews
+event waits after timeout/message check-ins and collects the viewer after
+success, failure, or explicit stop. hc manages terminals; window placement
+belongs to the viewing application. Linux uses `setsid`/`nohup` for the
+collector; macOS uses `nohup`/`disown` without requiring `setsid`.
+
+The workload remains in its independent systemd/launchd runner. Closing the
+progress terminal does not cancel it. The viewer emits no additional hc
+completion note; `codex queue` remains the task's completion mechanism.
+An invalid hc caller or viewer failure leaves the job running with logs and
+does not fall back to controlling a herdr-tui session.
+
+### herdr-tui panes
 
 The pane opens **to the right of the calling pane, in its current tab**, without
 stealing focus. It runs a log viewer, never the workload. Closing the pane leaves
@@ -139,15 +170,21 @@ bash -n bin/codex-bg && bash -n install.sh
 python3 -m unittest discover -s tests -v
 # In a Linux Herdr pane with user systemd:
 CODEX_BG_LIVE_HERDR=1 python3 -m unittest discover -s tests -v
+# In an hc terminal on Linux with user systemd:
+CODEX_BG_LIVE_HC=1 python3 -B -m unittest discover -s tests -v
 ```
 
 Unit tests stub external commands (including a fake `launchctl` for the macOS
 backend). Opt-in live Linux tests create temporary systemd jobs and panes,
 verify auto-close and that manual pane closure leaves the job running, then
-clean them up. They replace the completion receiver with a local stub; they do
+clean them up. hc live checks cover successful/failed jobs, explicit stop,
+automatic viewer removal, and closing the viewer while the task continues.
+They replace the completion receiver with a local stub; they do
 not send messages to a real Codex thread. GitHub Actions runs the unit suite on
 `ubuntu-latest` and `macos-latest`; the macOS job also runs a live launchd smoke
-with a stub `codex`. Neither job exercises a live Codex or Herdr session.
+with a stub `codex`. Neither job exercises a live Codex, hc, or herdr-tui session.
+macOS hc viewer setup is covered by command stubs; live hc verification here
+was performed on Linux, not on a Mac.
 
 ## License
 
